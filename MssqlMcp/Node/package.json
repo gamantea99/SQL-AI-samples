@@ -24,6 +24,7 @@
     "@azure/identity": "^4.8.0",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "dotenv": "^10.0.0",
+    "msnodesqlv8": "^5.1.1",
     "mssql": "^11.0.1"
   },
   "type": "module"

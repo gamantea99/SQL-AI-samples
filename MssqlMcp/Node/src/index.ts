@@ -18,7 +18,10 @@ import { CreateTableTool } from "./tools/CreateTableTool.js";
 import { CreateIndexTool } from "./tools/CreateIndexTool.js";
 import { ListTableTool } from "./tools/ListTableTool.js";
 import { DropTableTool } from "./tools/DropTableTool.js";
-import { DefaultAzureCredential, InteractiveBrowserCredential } from "@azure/identity";
+import {
+  DefaultAzureCredential,
+  InteractiveBrowserCredential,
+} from "@azure/identity";
 import { DescribeTableTool } from "./tools/DescribeTableTool.js";
 
 // MSSQL Database connection configuration
@@ -29,36 +32,66 @@ let globalSqlPool: sql.ConnectionPool | null = null;
 let globalAccessToken: string | null = null;
 let globalTokenExpiresOn: Date | null = null;
 
-// Function to create SQL config with fresh access token, returns token and expiry
-export async function createSqlConfig(): Promise<{ config: sql.config, token: string, expiresOn: Date }> {
-  const credential = new InteractiveBrowserCredential({
-    redirectUri: 'http://localhost'
-    // disableAutomaticAuthentication : true
-  });
-  const accessToken = await credential.getToken('https://database.windows.net/.default');
+// Function to create SQL config with auto-detected authentication
+export async function createSqlConfig(): Promise<{
+  config: sql.config;
+  token?: string;
+  expiresOn?: Date;
+}> {
+  // Detect authentication type from env or MCP config
+  const authType = process.env.AUTH_TYPE?.toLowerCase() || "windows"; // "aad" or "windows"
+  const trustServerCertificate =
+    process.env.TRUST_SERVER_CERTIFICATE?.toLowerCase() === "true";
+  const connectionTimeout = process.env.CONNECTION_TIMEOUT
+    ? parseInt(process.env.CONNECTION_TIMEOUT, 10)
+    : 30;
+  const server = process.env.SERVER_NAME!;
+  const database = process.env.DATABASE_NAME!;
 
-  const trustServerCertificate = process.env.TRUST_SERVER_CERTIFICATE?.toLowerCase() === 'true';
-  const connectionTimeout = process.env.CONNECTION_TIMEOUT ? parseInt(process.env.CONNECTION_TIMEOUT, 10) : 30;
-
-  return {
-    config: {
-      server: process.env.SERVER_NAME!,
-      database: process.env.DATABASE_NAME!,
-      options: {
-        encrypt: true,
-        trustServerCertificate
-      },
-      authentication: {
-        type: 'azure-active-directory-access-token',
+  if (authType === "windows") {
+    // Windows authentication using msnodesqlv8 driver
+    return {
+      config: {
+        server,
+        database,
+        driver: "msnodesqlv8",
         options: {
-          token: accessToken?.token!,
+          trustedConnection: true,
+          trustServerCertificate,
         },
+        connectionTimeout: connectionTimeout * 1000,
       },
-      connectionTimeout: connectionTimeout * 1000, // convert seconds to milliseconds
-    },
-    token: accessToken?.token!,
-    expiresOn: accessToken?.expiresOnTimestamp ? new Date(accessToken.expiresOnTimestamp) : new Date(Date.now() + 30 * 60 * 1000)
-  };
+    };
+  } else {
+    // Default: Azure AD authentication
+    const credential = new InteractiveBrowserCredential({
+      redirectUri: "http://localhost",
+    });
+    const accessToken = await credential.getToken(
+      "https://database.windows.net/.default"
+    );
+    return {
+      config: {
+        server,
+        database,
+        options: {
+          encrypt: true,
+          trustServerCertificate,
+        },
+        authentication: {
+          type: "azure-active-directory-access-token",
+          options: {
+            token: accessToken?.token!,
+          },
+        },
+        connectionTimeout: connectionTimeout * 1000,
+      },
+      token: accessToken?.token!,
+      expiresOn: accessToken?.expiresOnTimestamp
+        ? new Date(accessToken.expiresOnTimestamp)
+        : new Date(Date.now() + 30 * 60 * 1000),
+    };
+  }
 }
 
 const updateDataTool = new UpdateDataTool();
@@ -73,13 +106,13 @@ const describeTableTool = new DescribeTableTool();
 const server = new Server(
   {
     name: "mssql-mcp-server",
-    version: "0.1.0",
+    version: "0.1.1",
   },
   {
     capabilities: {
       tools: {},
     },
-  },
+  }
 );
 
 // Read READONLY env variable
@@ -90,7 +123,16 @@ const isReadOnly = process.env.READONLY === "true";
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: isReadOnly
     ? [listTableTool, readDataTool, describeTableTool] // todo: add searchDataTool to the list of tools available in readonly mode once implemented
-    : [insertDataTool, readDataTool, describeTableTool, updateDataTool, createTableTool, createIndexTool, dropTableTool, listTableTool], // add all new tools here
+    : [
+        insertDataTool,
+        readDataTool,
+        describeTableTool,
+        updateDataTool,
+        createTableTool,
+        createIndexTool,
+        dropTableTool,
+        listTableTool,
+      ], // add all new tools here
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -122,7 +164,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case describeTableTool.name:
         if (!args || typeof args.tableName !== "string") {
           return {
-            content: [{ type: "text", text: `Missing or invalid 'tableName' argument for describe_table tool.` }],
+            content: [
+              {
+                type: "text",
+                text: `Missing or invalid 'tableName' argument for describe_table tool.`,
+              },
+            ],
             isError: true,
           };
         }
@@ -164,21 +211,28 @@ runServer().catch((error) => {
 // Connect to SQL only when handling a request
 
 async function ensureSqlConnection() {
-  // If we have a pool and it's connected, and the token is still valid, reuse it
-  if (
-    globalSqlPool &&
-    globalSqlPool.connected &&
-    globalAccessToken &&
-    globalTokenExpiresOn &&
-    globalTokenExpiresOn > new Date(Date.now() + 2 * 60 * 1000) // 2 min buffer
-  ) {
-    return;
+  // If using Azure AD, check token validity
+  const authType = process.env.AUTH_TYPE?.toLowerCase() || "windows";
+  if (authType === "aad") {
+    if (
+      globalSqlPool &&
+      globalSqlPool.connected &&
+      globalAccessToken &&
+      globalTokenExpiresOn &&
+      globalTokenExpiresOn > new Date(Date.now() + 2 * 60 * 1000)
+    ) {
+      return;
+    }
+  } else {
+    if (globalSqlPool && globalSqlPool.connected) {
+      return;
+    }
   }
 
-  // Otherwise, get a new token and reconnect
+  // Otherwise, get a new config and reconnect
   const { config, token, expiresOn } = await createSqlConfig();
-  globalAccessToken = token;
-  globalTokenExpiresOn = expiresOn;
+  globalAccessToken = token ?? null;
+  globalTokenExpiresOn = expiresOn ?? null;
 
   // Close old pool if exists
   if (globalSqlPool && globalSqlPool.connected) {
@@ -197,4 +251,13 @@ function wrapToolRun(tool: { run: (...args: any[]) => Promise<any> }) {
   };
 }
 
-[insertDataTool, readDataTool, updateDataTool, createTableTool, createIndexTool, dropTableTool, listTableTool, describeTableTool].forEach(wrapToolRun);
+[
+  insertDataTool,
+  readDataTool,
+  updateDataTool,
+  createTableTool,
+  createIndexTool,
+  dropTableTool,
+  listTableTool,
+  describeTableTool,
+].forEach(wrapToolRun);
